@@ -6,101 +6,128 @@
 #include <semaphore.h>
 #include "mapreduce.h"
 
-struct node {
-	char key[128]; // TODO: need to change this
-	char value[16];
-	struct node *next;
+struct kvpair
+{
+	char *key;
+	char *value;
+	int valid;
+	struct kvpair *next;
 };
 
-struct node **part_table;
+Mapper fp_map;
+Reducer fp_reduce;
+Partitioner fp_part;
 
+struct kvpair **part;
 char **files;
-int partitions;
-
-int next_file = 0;
+int n_partitions;
+int next_file = 1; // Files start from argv[1]
 int next_partition = 0;
 
-pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t reduce_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t part_lock = PTHREAD_MUTEX_INITIALIZER;
 
-Partitioner fp_part;
-Mapper 		fp_map;
-Reducer 	fp_reduce;
-
-void *map_worker()
+void map_pool(void* args)
 {
-	char *file;
-		
-	while(files[next_file]) {
-		pthread_mutex_lock(&map_lock);
-		if(files[next_file]) {
-			file = files[next_file++];
-			pthread_mutex_unlock(&map_lock);
-			fp_map(file);
-		} else {
-			pthread_mutex_unlock(&map_lock);
-		}
-	}
+    char *file;
+
+    while(files[next_file] != NULL && strlen(files[next_file]) > 0) {
+        pthread_mutex_lock(&file_lock);
+        if(files[next_file]) {
+            file = files[next_file++];
+            pthread_mutex_unlock(&file_lock);
+            fp_map(file);
+        } else {
+            pthread_mutex_unlock(&file_lock);
+        }
+    }
 }
 
-void *reduce_worker()
+void reduce_pool(void* args)
 {
-	int np;
-	while(next_partition < partitions-1) {
-		pthread_mutex_lock(&reduce_lock);
-		if(next_partition < partitions-1) {
-			np = next_partition++;
-			pthread_mutex_unlock(&reduce_lock);
-			fp_reduce(part_table[np]->key, get_next, np); //need to verify this
-		} else {
-			pthread_mutex_unlock(&reduce_lock);
-		}
-	}
-}
-
-char* get_next(char *key, int partition_number)
-{
-	char *ret;
-	struct node *ptr;
-
-	pthread_mutex_lock(&part_lock);
-	ptr = part_table[partition_number];
-	if(ptr == NULL) {
-		ret = NULL;
-	}
-	else {
-		ret = ptr->value;
-		part_table[partition_number] = ptr->next;
-		free(ptr);
-	}
-	pthread_mutex_unlock(&part_lock);
-
-	return ret;
+	struct kvpair *ptr, *iter;
+    int p;
+	
+    while(next_partition < n_partitions) {
+        pthread_mutex_lock(&part_lock);
+        if(next_partition < n_partitions) {    	
+            p= next_partition++;
+            pthread_mutex_unlock(&part_lock);
+            ptr = part[p];
+		    while(ptr != NULL) {
+			    iter = ptr;
+			    fp_reduce(ptr->key, get_next, p);
+		    	ptr = ptr->next;
+			    while(ptr != NULL) {
+			    	if(strcmp(ptr->key, iter->key) != 0) {
+			    		break;
+			    	}
+				    ptr = ptr->next;
+			    }
+		    }   	
+	    } else {
+            pthread_mutex_unlock(&part_lock);
+        }
+    }
 }
 
 void MR_Emit(char *key, char *value)
 {
-	struct node *new, *ptr;
+	struct kvpair *new = malloc(sizeof(struct kvpair));
+	new->key = strdup(key);
+	new->value = strdup(value);
+	new->valid = 1;
 
-	new = malloc(sizeof(struct node));
-	strcpy(new->value, value);
-	strcpy(new->key, key);
-	new->next = NULL;
-	
-	// Need to acquire lock to modify hashtable
+	int p = fp_part(key, n_partitions);
+
+	struct kvpair *ptr = part[p];
+	struct kvpair *prev;
+
 	pthread_mutex_lock(&part_lock);
-	ptr = part_table[fp_part(key, partitions)];
-	if(ptr == NULL) {
-		ptr = new;
-	} else {
-		while (ptr->next != NULL) {
-			ptr = ptr->next;
-		}
-		ptr->next = new;
+    if(ptr == NULL) {
+		new->next = NULL;
+		part[p] = new;
+		goto end;
 	}
-	// Release hash table lock
-	pthread_mutex_unlock(&part_lock);
+
+	while(ptr != NULL && (strcmp(ptr->key, key) < 0)) {
+		prev = ptr;
+		ptr = ptr->next;
+	}
+	new->next = ptr;
+	if(prev != NULL)
+		prev->next = new;
+	else
+		part[p] = new;
+
+end:
+    pthread_mutex_unlock(&part_lock);
+}
+
+char* get_next(char *key, int partition_number)
+{
+	struct kvpair *ptr;
+	char *temp;
+
+	ptr = part[partition_number];
+	if (ptr == NULL)
+		return NULL;
+
+	if(strcmp(ptr->key, key) == 0 && ptr->valid) {
+		ptr->valid = 0;
+		return ptr->value;
+	}
+
+	ptr = ptr->next;
+	while(ptr != NULL) {
+		if(strcmp(ptr->key, key) == 0 && ptr->valid) {
+			ptr->valid = 0;
+			return ptr->value;
+		}
+		ptr = ptr->next;
+	}
+
+	return NULL;
 }
 
 unsigned long MR_DefaultHashPartition(char *key, int num_partitions)
@@ -114,7 +141,9 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions)
 
 unsigned long MR_SortedPartition(char *key, int num_partitions)
 {
-
+	unsigned long temp = atoi(key);
+	temp = temp >> (32 - num_partitions/2);
+	return temp;
 }
 
 void MR_Run(int argc, char *argv[], 
@@ -122,30 +151,43 @@ void MR_Run(int argc, char *argv[],
 	    Reducer reduce, int num_reducers, 
 	    Partitioner partition, int num_partitions)
 {
-	int i;
-	pthread_t map_threads[num_mappers];
-	pthread_t reduce_threads[num_reducers];
-	files = argv;
-	partitions = num_partitions;
-	part_table = malloc(partitions * sizeof(struct node*));
+    int i;
 
-	fp_map = map;
+	pthread_t mthread[num_mappers], rthread[num_reducers];
+
+	n_partitions = num_partitions;
+    files = argv;
+
+    fp_map = map;
 	fp_reduce = reduce;
 	fp_part = partition;
 
-	for(i=0; i<num_mappers; i++) {
-		pthread_create(&(map_threads[i]), NULL, map_worker, NULL);
-	}
-	for(i=0; i<num_mappers; i++) {
-		pthread_join(map_threads[i], NULL);
-	}
+    part = (struct kvpair *)malloc(n_partitions * sizeof(struct kvpair *));
 
-	for(i=0; i<num_reducers; i++) {
-		pthread_create(&(reduce_threads[i]), NULL, reduce_worker, NULL);
-	}
-	for(i=0; i<num_reducers; i++) {
-		pthread_join(reduce_threads[i], NULL);
-	}
+    for(i=0; i<num_mappers; i++) {
+    	pthread_create(&mthread[i], NULL, (void *)map_pool, NULL);
+    }
+    for(i=0; i<num_mappers; i++) {
+        pthread_join(mthread[i], NULL);
+    }
 
-	free(part_table);
+    for(i=0; i<num_reducers; i++) {
+    	pthread_create(&rthread[i], NULL, (void *)reduce_pool, NULL);
+    }
+    for(i=0; i<num_mappers; i++) {
+        pthread_join(rthread[i], NULL);
+    }
+
+    for(i=0; i<n_partitions; i++) {
+        struct kvpair *ptr = part[i];
+        struct kvpair *iter;
+        
+        while(ptr != NULL) {
+            iter = ptr;
+            ptr = ptr->next;
+            free(iter->key);
+            free(iter->value);
+            free(iter);
+        }
+    }
 }

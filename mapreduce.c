@@ -6,54 +6,138 @@
 #include <semaphore.h>
 #include "mapreduce.h"
 
-typedef struct {
-	char *key;
-	Getter fp;
-	int partition_number;
-} myarg_t;
+struct vnode
+{
+	char *value;
+	struct vnode *next;
+};
 
 struct kvpair
 {
 	char *key;
-	char *value;
-	int valid;
+	struct vnode *vn;
+	struct vnode *current;
 	struct kvpair *next;
 };
 
+Mapper fp_map;
 Reducer fp_reduce;
 Partitioner fp_part;
 
-struct kvpair *part[10];
-
+struct kvpair **part;
+char **files;
 int n_partitions;
+int next_file = 1; // Files start from argv[1]
+int next_partition = 0;
 
-void MR_Emit(char *key, char *value)
+pthread_mutex_t file_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t part_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void map_pool(void* args)
 {
-	struct kvpair *new = malloc(sizeof(struct kvpair));
-	new->key = strdup(key);
+    char *file;
+
+    while(files[next_file] != NULL && strlen(files[next_file]) > 0) {
+        pthread_mutex_lock(&file_lock);
+        if(files[next_file]) {
+            file = files[next_file++];
+            pthread_mutex_unlock(&file_lock);
+            fp_map(file);
+        } else {
+            pthread_mutex_unlock(&file_lock);
+        }
+    }
+}
+
+void reduce_pool(void* args)
+{
+	struct kvpair *ptr, *iter;
+    int p;
+	
+    while(next_partition < n_partitions) {
+        pthread_mutex_lock(&part_lock);
+        if(next_partition < n_partitions) {    	
+            p = next_partition++;
+            pthread_mutex_unlock(&part_lock);
+            ptr = part[p];
+		    while(ptr != NULL) {
+			    fp_reduce(ptr->key, get_next, p);
+		    	ptr = ptr->next;
+			    } 	
+	    } else {
+            pthread_mutex_unlock(&part_lock);
+        }
+    }
+}
+
+void insert_value(struct kvpair *key_ptr, char *value)
+{
+	struct vnode *ptr, *prev = NULL, *new;
+	new = malloc(sizeof(struct vnode));
 	new->value = strdup(value);
-	new->valid = 1;
 
-	int p = fp_part(key, n_partitions);
-
-	struct kvpair *ptr = part[p];
-	struct kvpair *prev;
+	ptr = key_ptr->vn;
 
 	if(ptr == NULL) {
-		new->next = NULL;
-		part[p] = new;
+		key_ptr->vn = new;
+		key_ptr->current = new;
 		return;
 	}
 
-	while(ptr != NULL && (strcmp(ptr->key, key) < 0)) {
+	while(ptr != NULL && (strcmp(ptr->value, value) < 0)) {
 		prev = ptr;
 		ptr = ptr->next;
 	}
 	new->next = ptr;
 	if(prev != NULL)
 		prev->next = new;
+	else {
+		key_ptr->vn = new;
+		key_ptr->current = new;
+	}
+}
+
+void MR_Emit(char *key, char *value)
+{
+	struct kvpair *ptr, *prev=NULL, *new;
+	int p;
+
+	p = fp_part(key, n_partitions);
+	ptr = part[p];
+
+	pthread_mutex_lock(&part_lock);
+	if(ptr == NULL) {
+		new = malloc(sizeof(struct kvpair));
+		new->key = strdup(key);
+		new->next = NULL;
+		part[p] = new;
+		insert_value(new, value);
+		goto end;
+	}
+
+	while(ptr != NULL) {
+		int cmp = strcmp(ptr->key, key);
+		if(cmp == 0) {
+			insert_value(ptr, value);
+			goto end;
+		} else if(cmp > 0) {
+			break;
+		}
+		prev = ptr;
+		ptr = ptr->next;
+	}
+
+	new = malloc(sizeof(struct kvpair));
+	new->key = strdup(key);
+	new->next = ptr;
+	if(prev != NULL)
+		prev->next = new;
 	else
 		part[p] = new;
+	insert_value(new, value);
+
+end:
+	pthread_mutex_unlock(&part_lock);
 }
 
 char* get_next(char *key, int partition_number)
@@ -64,21 +148,20 @@ char* get_next(char *key, int partition_number)
 	ptr = part[partition_number];
 	if (ptr == NULL)
 		return NULL;
-
-	if(strcmp(ptr->key, key) == 0 && ptr->valid) {
-		ptr->valid = 0;
-		return ptr->value;
-	}
-
-	ptr = ptr->next;
+	
 	while(ptr != NULL) {
-		if(strcmp(ptr->key, key) == 0 && ptr->valid) {
-			ptr->valid = 0;
-			return ptr->value;
+		if(strcmp(ptr->key, key) == 0) {
+			
+			if(ptr->current == NULL)
+				goto end;
+			temp = ptr->current->value;
+			ptr->current = ptr->current->next;
+			return temp;
 		}
 		ptr = ptr->next;
 	}
 
+end:
 	return NULL;
 }
 
@@ -94,45 +177,58 @@ unsigned long MR_DefaultHashPartition(char *key, int num_partitions)
 unsigned long MR_SortedPartition(char *key, int num_partitions)
 {
 	unsigned long temp = atoi(key);
+	temp = temp & 0x00000000ffffffff;
 	temp = temp >> (32 - num_partitions/2);
 	return temp;
 }
-
-void dummy(void)
-{
-	struct kvpair *ptr, *iter;
-	for(int i=0; i<n_partitions; i++) {
-		ptr = part[i];
-		while(ptr != NULL) {
-			iter = ptr;
-			fp_reduce(ptr->key, get_next, i);
-			ptr = ptr->next;
-			while(ptr != NULL) {
-				if(strcmp(ptr->key, iter->key) != 0) {
-					break;
-				}
-				ptr = ptr->next;
-			}
-		}	
-	}
-}
-
 
 void MR_Run(int argc, char *argv[], 
 	    Mapper map, int num_mappers, 
 	    Reducer reduce, int num_reducers, 
 	    Partitioner partition, int num_partitions)
 {
-	pthread_t mthread, rthread;
+    int i;
+
+	pthread_t mthread[num_mappers], rthread[num_reducers];
 
 	n_partitions = num_partitions;
+    files = argv;
 
+    fp_map = map;
 	fp_reduce = reduce;
 	fp_part = partition;
 
-	pthread_create(&mthread, NULL, (void *)map, argv[1]);
-	pthread_join(mthread, NULL);
+    part = (struct kvpair **)malloc(n_partitions * sizeof(struct kvpair *));
 
-	pthread_create(&rthread, NULL, (void *)dummy, NULL);
-	pthread_join(rthread, NULL);
+    for(i=0; i<num_mappers; i++) {
+    	pthread_create(&mthread[i], NULL, (void *)map_pool, NULL);
+    }
+    for(i=0; i<num_mappers; i++) {
+        pthread_join(mthread[i], NULL);
+    }
+
+    for(i=0; i<num_reducers; i++) {
+    	pthread_create(&rthread[i], NULL, (void *)reduce_pool, NULL);
+    }
+    for(i=0; i<num_mappers; i++) {
+        pthread_join(rthread[i], NULL);
+    }
+
+    for(i=0; i<n_partitions; i++) {
+        struct kvpair *ptr = part[i];
+        struct kvpair *iter;
+        
+        while(ptr != NULL) {
+            struct vnode *temp;
+            while(ptr->vn) {
+            	temp = ptr->vn;
+            	ptr->vn = ptr->vn->next;
+            	free(temp->value);
+            	free(temp);
+            }
+            iter = ptr;
+            ptr = ptr->next;
+            free(iter);
+        }
+    }
 }
