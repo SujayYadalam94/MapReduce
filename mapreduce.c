@@ -75,6 +75,7 @@ void insert_value(struct kvpair *key_ptr, char *value)
 	struct vnode *ptr, *prev = NULL, *new;
 	new = malloc(sizeof(struct vnode));
 	new->value = strdup(value);
+	new->next = NULL;
 
 	ptr = key_ptr->vn;
 
@@ -103,15 +104,16 @@ void MR_Emit(char *key, char *value)
 	int p;
 
 	p = fp_part(key, n_partitions);
-	ptr = part[p];
 
 	pthread_mutex_lock(&part_lock);
+	ptr = part[p];
 	if(ptr == NULL) {
 		new = malloc(sizeof(struct kvpair));
 		new->key = strdup(key);
 		new->next = NULL;
-		part[p] = new;
 		insert_value(new, value);
+
+		part[p] = new;
 		goto end;
 	}
 
@@ -210,7 +212,7 @@ void MR_Run(int argc, char *argv[],
     for(i=0; i<num_reducers; i++) {
     	pthread_create(&rthread[i], NULL, (void *)reduce_pool, NULL);
     }
-    for(i=0; i<num_mappers; i++) {
+    for(i=0; i<num_reducers; i++) {
         pthread_join(rthread[i], NULL);
     }
 
