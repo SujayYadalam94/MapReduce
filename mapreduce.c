@@ -167,6 +167,10 @@ end:
 	return NULL;
 }
 
+unsigned long Log2n(unsigned long n){
+    return (n > 1) ? 1 + Log2n(n/2) : 0;
+}
+
 unsigned long MR_DefaultHashPartition(char *key, int num_partitions)
 {
     unsigned long hash = 5381;
@@ -180,9 +184,10 @@ unsigned long MR_SortedPartition(char *key, int num_partitions)
 {
 	unsigned long temp = atoi(key);
 	temp = temp & 0x00000000ffffffff;
-	temp = temp >> (32 - num_partitions/2);
+	temp = temp >> (32 - Log2n(num_partitions));
 	return temp;
 }
+
 
 void MR_Run(int argc, char *argv[], 
 	    Mapper map, int num_mappers, 
