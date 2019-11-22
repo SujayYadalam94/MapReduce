@@ -52,7 +52,8 @@ void map_pool(void* args) {
 }
 
 void reduce_pool(void* args) {
-    struct kvpair *ptr, *temp;
+    struct kvpair *ptr;
+    struct vnode *temp;
     int p;
 
     while (next_partition < n_partitions) {
@@ -64,8 +65,7 @@ void reduce_pool(void* args) {
             while (ptr != NULL) {
                 fp_reduce(ptr->key, get_next, p);
                 ptr = ptr->next;
-                // TODO(sujay): need to free part[p]
-                while(part[p]->vn) {
+                while (part[p]->vn) {
                     temp = part[p]->vn;
                     part[p]->vn = part[p]->vn->next;
                     free(temp->value);
